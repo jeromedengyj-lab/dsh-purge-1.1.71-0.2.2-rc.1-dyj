@@ -1,0 +1,271 @@
+diff --git a/lib/core.js b/lib/core.js
+index c82b473..50eb705 100644
+--- a/lib/core.js
++++ b/lib/core.js
+@@ -1,7 +1,7 @@
+ import nodeFs from "node:fs";
+ import os from "node:os";
+ import path from "node:path";
+-import { createHash } from "node:crypto";
++import { createHash, randomBytes } from "node:crypto";
+ import { execFileSync, spawn } from "node:child_process";
+ import { createRequire } from "node:module";
+ import { fileURLToPath } from "node:url";
+@@ -74,16 +74,67 @@ export async function atomicWriteFile(fp, content, encoding = "utf8") {
+   }
+ }
+ 
++// Local hardening (2026-11-09, Windows / dsh 0.2.2-rc.1):
++// While app.asar is being unpacked, hostFs' path routing can make the .copytmp
++// file invisible to the subsequent rename (ENOENT), and Windows refuses to
++// rename over an existing .bak (EPERM/EEXIST). A backup failure must never
++// escalate into an unhandled rejection that kills the host on startup, so every
++// failure path degrades to one plain copy. Only a total copy failure throws.
+ export async function atomicCopyFile(src, dst) {
+   const dir = path.dirname(dst);
+   await fsp.mkdir(dir, { recursive: true });
+-  const tmp = `${dst}.${process.pid}.${Date.now()}.copytmp`;
+-  await fsp.copyFile(src, tmp);
++  const tmp = `${dst}.${process.pid}.${Date.now()}.${randomBytes(3).toString("hex")}.copytmp`;
++  const fallbackCopy = () => fsp.copyFile(src, dst);
++  try {
++    await fsp.copyFile(src, tmp);
++  } catch (e) {
++    try { await fsp.unlink(tmp); } catch { /* ignore */ }
++    await fallbackCopy();
++    return;
++  }
+   try {
+     await fsp.rename(tmp, dst);
+   } catch (e) {
++    const code = e && e.code;
++    if (code === "EEXIST" || code === "EPERM" || code === "EACCES" || code === "EBUSY") {
++      try {
++        try { await fsp.unlink(dst); } catch { /* ignore */ }
++        await fsp.rename(tmp, dst);
++        return;
++      } catch { /* fall through to the plain-copy fallback */ }
++    }
++    // ENOENT (tmp moved by asar routing / AV), EXDEV, etc.
+     try { await fsp.unlink(tmp); } catch { /* ignore */ }
+-    throw e;
++    await fallbackCopy();
++  }
++}
++
++// Synchronous counterpart for synchronous shim patching: it guarantees the
++// "back up first, overwrite second" order, and its exceptions are catchable by
++// the caller's ordinary try/catch (an un-awaited async call would not be).
++export function atomicCopyFileSync(src, dst) {
++  nodeFs.mkdirSync(path.dirname(dst), { recursive: true });
++  const tmp = `${dst}.${process.pid}.${Date.now()}.${randomBytes(3).toString("hex")}.copytmp`;
++  try {
++    nodeFs.copyFileSync(src, tmp);
++  } catch (e) {
++    try { nodeFs.unlinkSync(tmp); } catch { /* ignore */ }
++    nodeFs.copyFileSync(src, dst);
++    return;
++  }
++  try {
++    nodeFs.renameSync(tmp, dst);
++  } catch (e) {
++    const code = e && e.code;
++    if (code === "EEXIST" || code === "EPERM" || code === "EACCES" || code === "EBUSY") {
++      try {
++        try { nodeFs.unlinkSync(dst); } catch { /* ignore */ }
++        nodeFs.renameSync(tmp, dst);
++        return;
++      } catch { /* fall through to the plain-copy fallback */ }
++    }
++    try { nodeFs.unlinkSync(tmp); } catch { /* ignore */ }
++    nodeFs.copyFileSync(src, dst);
+   }
+ }
+ 
+@@ -2480,8 +2531,27 @@ const COMPLETE_PROMPT_WATERFALL_INJECT =
+   "\t\t\t\tconst tail = rest.filter((s) => String(s?.name || \"\") !== String(base.name || \"\"));\n" +
+   "\t\t\t\treturn [...purge, ...tail, base]; // [dsh-purge] complete prompt keeps inject + agent-instructions\n" +
+   "\t\t\t})(completeSection, dshPurgeSections, dshPurgeRest),\n" +
+-  "\t\t\tcontexts: runtimeContextSuppressed ? [] : transformed.contexts\n" +
+-  "\t\t};";
++			"\t\t\tcontexts: runtimeContextSuppressed ? [] : transformed.contexts\n" +
++		"\t\t};";
++
++/**
++ * 0.2.2-rc.1 起官方 assemble 改成带 tools / requiredContexts 的结构，
++ * COMPLETE_PROMPT_KEEP_INJECT 的 6 个旧 pattern 全部匹配不上，重启终检又要求
++ * transformed.sections : [completeSection] 消失，于是永远报「清洗没有写进全部宿主」。
++ * 这里只替换丢注入的那一行，其余官方字段原样保留，语义与
++ * COMPLETE_PROMPT_WATERFALL_INJECT 一致：complete 模式仍带上 waterfall 里的 dsh-purge 段。
++ */
++const COMPLETE_PROMPT_022_INJECT_LINE =
++	"\t\t\tsections: completeSection === void 0 ? transformed.sections : (function (complete, transformed) {\n" +
++	"\t\t\t\tconst dshPurgeSections = (transformed.sections || []).filter((s) => String(s && s.name || \"\").startsWith(\"dsh-purge\") && String(s.text || \"\").length > 0);\n" +
++	"\t\t\t\tconst dshPurgeRest = (transformed.sections || []).filter((s) => !String(s && s.name || \"\").startsWith(\"dsh-purge\"));\n" +
++	"\t\t\t\tconst base = { ...complete };\n" +
++	"\t\t\t\tconst tail = dshPurgeRest.filter((s) => String(s?.name || \"\") !== String(base.name || \"\"));\n" +
++	"\t\t\t\treturn [...dshPurgeSections, ...tail, base]; // [dsh-purge] complete prompt keeps inject + agent-instructions\n" +
++	"\t\t\t})(completeSection, transformed),\n";
++
++const COMPLETE_PROMPT_022_NEEDLE =
++	"\t\t\tsections: completeSection === void 0 ? transformed.sections : [completeSection],\n";
+ 
+ function clearShellNetworkBan(pattern) {
+   return pattern
+@@ -3906,6 +3976,11 @@ const NEW_TOOL_PATCHES = [
+           "\t\t};",
+         replace: COMPLETE_PROMPT_WATERFALL_INJECT,
+       },
++      {
++        // 0.2.2-rc.1 官方新增 tools / requiredContexts 结构；只换丢注入的那一行。
++        pattern: COMPLETE_PROMPT_022_NEEDLE,
++        replace: COMPLETE_PROMPT_022_INJECT_LINE,
++      },
+     ],
+     forbid: ["dsh-purge:committed"],
+     markersAny: true,
+diff --git a/lib/desktop.js b/lib/desktop.js
+index 6c60439..ab2c188 100644
+--- a/lib/desktop.js
++++ b/lib/desktop.js
+@@ -6,7 +6,7 @@ import { randomBytes } from "node:crypto";
+ import { isWshAscii, wshLiteral } from "./official-update.js";
+ import { asarArchiveIsFile, hostFs } from "./extract-asar.js";
+ import { hostPromptKeepsInject } from "./host-clean.js";
+-import { atomicCopyFile, atomicWriteSync } from "./core.js";
++import { atomicCopyFileSync, atomicWriteSync } from "./core.js";
+ 
+ function restartUniqSuffix() {
+   return `${process.pid}-${randomBytes(4).toString("hex")}`;
+@@ -1766,7 +1766,11 @@ export function repairOfficialCliAfterUnpack(exe = findDesktopAppExecutable()) {
+       // 原子写之前先存一份 .dsh-purge.bak，断电/磁盘满也能回退到官方原文。
+       const bak = `${fp}.dsh-purge.bak`;
+       if (!isFile(bak)) {
+-        try { atomicCopyFile(fp, bak); } catch { /* 写不了 bak 不致命 */ }
++        // Local fix: the old line called the async atomicCopyFile() without await,
++        // so its rename ENOENT escaped as an unhandled rejection and killed the
++        // dsh desktop host at startup. The sync version also guarantees that the
++        // original is backed up BEFORE atomicWriteSync() overwrites the shim.
++        try { atomicCopyFileSync(fp, bak); } catch { /* 写不了 bak 不致命 */ }
+       }
+       atomicWriteSync(fp, patched.text, "utf8");
+       report.shims.push({ path: fp, status: "patched" });
+diff --git a/lib/index.js b/lib/index.js
+index 8e43938..c6145db 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -1451,12 +1451,49 @@ async function handleSkillsCommand(rawInput) {
+   }
+ }
+ 
++/**
++ * 0.2.2-rc.1 的 dsh-agent-loop 只注册 provider / model 两个提示词变量，
++ * 但本包 cordis.patch.yml 的 personaSuffix 仍写 {{cwd}}（旧版宿主由部署层提供）。
++ * 缺这个变量时每次 assemble 都会抛 unknown prompt variable，整轮对话直接失败。
++ * 这里在插件侧补注册 cwd，让 personaSuffix 原文与工作目录信息一字不删地生效。
++ */
++function registerCwdPromptVariable(ctx) {
++  try {
++    const prompt = ctx?.systemPrompt;
++    if (!prompt || typeof prompt.variable !== "function") return;
++    prompt.variable("cwd", (context) => {
++      try {
++        for (const candidate of [
++          context?.agent?.options?.cwd,
++          context?.scope?.cwd,
++          context?.cwd,
++        ]) {
++          if (typeof candidate === "string" && candidate.trim()) return candidate;
++        }
++      } catch { /* ctx 代理偶尔不允许取属性 */ }
++      try {
++        const home = core.pinDshHome() || core.findDshHome();
++        if (home) {
++          const saved = fs.readFileSync(path.join(home, "dsh-purge", "last-cwd.txt"), "utf8").trim();
++          if (saved) return saved;
++        }
++      } catch { /* 文件不存在时走兜底 */ }
++      try { return process.cwd(); } catch { return ""; }
++    });
++  } catch (error) {
++    // 宿主以后自己注册 cwd（duplicate）时忽略，不阻断启动。
++    purgeLog("cwd-variable", { skipped: String(error?.message || error) });
++  }
++}
++
+ export function apply(ctx, config) {
+   const cfg = { ...DEFAULTS, ...(config || {}) };
+   if (!cfg.enabled) {
+     purgeLog("boot", { enabled: false });
+     return;
+   }
++  // 必须早于下面所有 early return：host 每次 assemble 都要能解析 personaSuffix 里的 {{cwd}}。
++  registerCwdPromptVariable(ctx);
+   purgeLog("boot", {
+     enabled: true,
+     surface: hostctl.currentSurface(),
+diff --git a/lib/redteam/index.js b/lib/redteam/index.js
+index f09e511..422a84e 100644
+--- a/lib/redteam/index.js
++++ b/lib/redteam/index.js
+@@ -226,9 +226,16 @@ function repairDelegation(text) {
+       changed = true
+     }
+   }
++  /*
++   * 0.2.2-rc.1 起 @deepseek-ai/dsh-tool-subagent-control 只导出 "." 主入口，
++   * `./list-agents` 子路径已合并进去（同一个 apply() 注册 list_agents /
++   * send_message / interrupt_agent）。若把下面这条旧行重新改成 disabled: false，
++   * 模块解析会失败 → 整份预设 broken → 「红队模式」被模式下拉过滤掉。
++   * 三个工具仍由 tool-subagent-control 主入口提供，能力不减，因此这条旧行
++   * 不再参与「重新启用」自愈，保持 disabled: true。
++   */
+   for (const id of [
+     "tool-subagent-control",
+-    "tool-subagent-list-agents",
+     "tool-subagent",
+     "tool-subagent-fork",
+   ]) {
+diff --git a/presets/redteam/agent.cordis.yml b/presets/redteam/agent.cordis.yml
+index b58a8ba..432193e 100644
+--- a/presets/redteam/agent.cordis.yml
++++ b/presets/redteam/agent.cordis.yml
+@@ -293,9 +293,13 @@
+       name: '@deepseek-ai/dsh-tool-subagent-control'
+       disabled: false
+ 
++    # 0.2.2-rc.1: dsh-tool-subagent-control 只导出 "." 主入口；list-agents 子路径
++    # 已合并进上面的 tool-subagent-control 行（同一个 apply() 注册 list_agents /
++    # send_message / interrupt_agent）。旧子路径解析失败会让整份预设被下拉过滤，
++    # 因此禁用这条冗余行，三个工具仍由主入口提供，能力不减。
+     - id: tool-subagent-list-agents
+       name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+-      disabled: false
++      disabled: true
+ 
+     - id: tool-subagent
+       name: '@deepseek-ai/dsh-tool-subagent'
+@@ -305,19 +309,11 @@
+         toolName: subagent
+         modelSelectionSettings: true
+         backgroundMode: continuable
+-        # 子智能体是角色执行者（信息收集/资产梳理/漏洞发现/漏洞利用/内网渗透），**必须是叶子节点**：
+-        # 靠提示词劝"不要再往下委派"是软的——模型完全可以无视。这里直接把委派工具从子会话的
+-        # 工具目录里摘掉，子智能体连看都看不到 subagent / subagent_fork / workflow / ralph。
+-        # maxDepth 同时收成 1 作为二道保险（默认 3 层太深，会白吃并发预算与上下文）。
++        # 子智能体是角色执行者（信息收集/资产梳理/漏洞发现/漏洞利用/内网渗透），**必须是叶子节点**。
++        # 0.2.2-rc.1 起 tool-subagent 不再接受 toolFilter / persona（遇到直接抛错，
++        # 整份预设会 broken 并被模式下拉过滤）。新版由宿主的 Agent Preset 继承限制
++        # 接管子智能体的委派工具；这里保留 maxDepth: 1 作为硬上限，子智能体仍无法再往下派发。
+         maxDepth: 1
+-        # 注意：不能 deny `subagent` —— 它是这一行自己注册的 scoped 工具，不在全局工具库里，
+-        # 写进 deny 会让 tools.restrict() 校验失败、整个委派路径报 "unknown global tool"（v0.8.0 踩过）。
+-        # 子智能体拿不到 subagent_fork/workflow/ralph，加上 maxDepth: 1，实际已无派发能力。
+-        toolFilter:
+-          deny:
+-            - subagent_fork
+-            - workflow
+-            - ralph
+ 
+     # Fork omits model selection so provider/model stay equal to the parent and
+     # the inherited history remains eligible for KV Cache reuse. This preset

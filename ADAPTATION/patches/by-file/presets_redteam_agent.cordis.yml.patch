@@ -1,0 +1,43 @@
+diff --git a/presets/redteam/agent.cordis.yml b/presets/redteam/agent.cordis.yml
+index b58a8ba..432193e 100644
+--- a/presets/redteam/agent.cordis.yml
++++ b/presets/redteam/agent.cordis.yml
+@@ -293,9 +293,13 @@
+       name: '@deepseek-ai/dsh-tool-subagent-control'
+       disabled: false
+ 
++    # 0.2.2-rc.1: dsh-tool-subagent-control 只导出 "." 主入口；list-agents 子路径
++    # 已合并进上面的 tool-subagent-control 行（同一个 apply() 注册 list_agents /
++    # send_message / interrupt_agent）。旧子路径解析失败会让整份预设被下拉过滤，
++    # 因此禁用这条冗余行，三个工具仍由主入口提供，能力不减。
+     - id: tool-subagent-list-agents
+       name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+-      disabled: false
++      disabled: true
+ 
+     - id: tool-subagent
+       name: '@deepseek-ai/dsh-tool-subagent'
+@@ -305,19 +309,11 @@
+         toolName: subagent
+         modelSelectionSettings: true
+         backgroundMode: continuable
+-        # 子智能体是角色执行者（信息收集/资产梳理/漏洞发现/漏洞利用/内网渗透），**必须是叶子节点**：
+-        # 靠提示词劝"不要再往下委派"是软的——模型完全可以无视。这里直接把委派工具从子会话的
+-        # 工具目录里摘掉，子智能体连看都看不到 subagent / subagent_fork / workflow / ralph。
+-        # maxDepth 同时收成 1 作为二道保险（默认 3 层太深，会白吃并发预算与上下文）。
++        # 子智能体是角色执行者（信息收集/资产梳理/漏洞发现/漏洞利用/内网渗透），**必须是叶子节点**。
++        # 0.2.2-rc.1 起 tool-subagent 不再接受 toolFilter / persona（遇到直接抛错，
++        # 整份预设会 broken 并被模式下拉过滤）。新版由宿主的 Agent Preset 继承限制
++        # 接管子智能体的委派工具；这里保留 maxDepth: 1 作为硬上限，子智能体仍无法再往下派发。
+         maxDepth: 1
+-        # 注意：不能 deny `subagent` —— 它是这一行自己注册的 scoped 工具，不在全局工具库里，
+-        # 写进 deny 会让 tools.restrict() 校验失败、整个委派路径报 "unknown global tool"（v0.8.0 踩过）。
+-        # 子智能体拿不到 subagent_fork/workflow/ralph，加上 maxDepth: 1，实际已无派发能力。
+-        toolFilter:
+-          deny:
+-            - subagent_fork
+-            - workflow
+-            - ralph
+ 
+     # Fork omits model selection so provider/model stay equal to the parent and
+     # the inherited history remains eligible for KV Cache reuse. This preset

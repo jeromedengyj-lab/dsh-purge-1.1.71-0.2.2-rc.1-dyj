@@ -1,0 +1,26 @@
+diff --git a/lib/desktop.js b/lib/desktop.js
+index 6c60439..ab2c188 100644
+--- a/lib/desktop.js
++++ b/lib/desktop.js
+@@ -6,7 +6,7 @@ import { randomBytes } from "node:crypto";
+ import { isWshAscii, wshLiteral } from "./official-update.js";
+ import { asarArchiveIsFile, hostFs } from "./extract-asar.js";
+ import { hostPromptKeepsInject } from "./host-clean.js";
+-import { atomicCopyFile, atomicWriteSync } from "./core.js";
++import { atomicCopyFileSync, atomicWriteSync } from "./core.js";
+ 
+ function restartUniqSuffix() {
+   return `${process.pid}-${randomBytes(4).toString("hex")}`;
+@@ -1766,7 +1766,11 @@ export function repairOfficialCliAfterUnpack(exe = findDesktopAppExecutable()) {
+       // 原子写之前先存一份 .dsh-purge.bak，断电/磁盘满也能回退到官方原文。
+       const bak = `${fp}.dsh-purge.bak`;
+       if (!isFile(bak)) {
+-        try { atomicCopyFile(fp, bak); } catch { /* 写不了 bak 不致命 */ }
++        // Local fix: the old line called the async atomicCopyFile() without await,
++        // so its rename ENOENT escaped as an unhandled rejection and killed the
++        // dsh desktop host at startup. The sync version also guarantees that the
++        // original is backed up BEFORE atomicWriteSync() overwrites the shim.
++        try { atomicCopyFileSync(fp, bak); } catch { /* 写不了 bak 不致命 */ }
+       }
+       atomicWriteSync(fp, patched.text, "utf8");
+       report.shims.push({ path: fp, status: "patched" });

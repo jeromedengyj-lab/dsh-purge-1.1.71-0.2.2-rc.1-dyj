@@ -1,0 +1,22 @@
+diff --git a/lib/redteam/index.js b/lib/redteam/index.js
+index f09e511..422a84e 100644
+--- a/lib/redteam/index.js
++++ b/lib/redteam/index.js
+@@ -226,9 +226,16 @@ function repairDelegation(text) {
+       changed = true
+     }
+   }
++  /*
++   * 0.2.2-rc.1 起 @deepseek-ai/dsh-tool-subagent-control 只导出 "." 主入口，
++   * `./list-agents` 子路径已合并进去（同一个 apply() 注册 list_agents /
++   * send_message / interrupt_agent）。若把下面这条旧行重新改成 disabled: false，
++   * 模块解析会失败 → 整份预设 broken → 「红队模式」被模式下拉过滤掉。
++   * 三个工具仍由 tool-subagent-control 主入口提供，能力不减，因此这条旧行
++   * 不再参与「重新启用」自愈，保持 disabled: true。
++   */
+   for (const id of [
+     "tool-subagent-control",
+-    "tool-subagent-list-agents",
+     "tool-subagent",
+     "tool-subagent-fork",
+   ]) {

@@ -1,0 +1,54 @@
+diff --git a/lib/index.js b/lib/index.js
+index 8e43938..c6145db 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -1451,12 +1451,49 @@ async function handleSkillsCommand(rawInput) {
+   }
+ }
+ 
++/**
++ * 0.2.2-rc.1 的 dsh-agent-loop 只注册 provider / model 两个提示词变量，
++ * 但本包 cordis.patch.yml 的 personaSuffix 仍写 {{cwd}}（旧版宿主由部署层提供）。
++ * 缺这个变量时每次 assemble 都会抛 unknown prompt variable，整轮对话直接失败。
++ * 这里在插件侧补注册 cwd，让 personaSuffix 原文与工作目录信息一字不删地生效。
++ */
++function registerCwdPromptVariable(ctx) {
++  try {
++    const prompt = ctx?.systemPrompt;
++    if (!prompt || typeof prompt.variable !== "function") return;
++    prompt.variable("cwd", (context) => {
++      try {
++        for (const candidate of [
++          context?.agent?.options?.cwd,
++          context?.scope?.cwd,
++          context?.cwd,
++        ]) {
++          if (typeof candidate === "string" && candidate.trim()) return candidate;
++        }
++      } catch { /* ctx 代理偶尔不允许取属性 */ }
++      try {
++        const home = core.pinDshHome() || core.findDshHome();
++        if (home) {
++          const saved = fs.readFileSync(path.join(home, "dsh-purge", "last-cwd.txt"), "utf8").trim();
++          if (saved) return saved;
++        }
++      } catch { /* 文件不存在时走兜底 */ }
++      try { return process.cwd(); } catch { return ""; }
++    });
++  } catch (error) {
++    // 宿主以后自己注册 cwd（duplicate）时忽略，不阻断启动。
++    purgeLog("cwd-variable", { skipped: String(error?.message || error) });
++  }
++}
++
+ export function apply(ctx, config) {
+   const cfg = { ...DEFAULTS, ...(config || {}) };
+   if (!cfg.enabled) {
+     purgeLog("boot", { enabled: false });
+     return;
+   }
++  // 必须早于下面所有 early return：host 每次 assemble 都要能解析 personaSuffix 里的 {{cwd}}。
++  registerCwdPromptVariable(ctx);
+   purgeLog("boot", {
+     enabled: true,
+     surface: hostctl.currentSurface(),
