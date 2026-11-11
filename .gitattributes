@@ -1,0 +1,5 @@
+# Keep patch files LF so `git apply` works on every platform.
+ADAPTATION/patches/*.patch text eol=lf
+ADAPTATION/patches/by-file/*.patch text eol=lf
+# Windows script files prefer CRLF.
+ADAPTATION/scripts/*.ps1 text eol=crlf
